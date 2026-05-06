@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers for data integrity
+    function isValidCenter(data) {
+      return data.keys().hasAll(['name', 'budget']) &&
+             data.name is string && data.name.size() > 0 &&
+             data.budget is number;
+    }
+
+    function isValidExpense(data) {
+      return data.keys().hasAll(['merchant', 'amount', 'category', 'date', 'status', 'centerId']) &&
+             data.amount is number &&
+             data.status in ['Pending', 'Approved', 'Declined', 'Reimbursed'];
+    }
+
+    // Shared Ledger Access (No Login Required)
+    match /shared_ledger/global_instance {
+      allow get: if true;
+      allow write: if true;
+
+      match /centers/{centerId} {
+        allow read, write: if true;
+      }
+
+      match /expenses/{expenseId} {
+        allow read, write: if true;
+      }
+
+      match /profile/settings {
+        allow read, write: if true;
+      }
+    }
+  }
+}

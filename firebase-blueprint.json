@@ -1,0 +1,57 @@
+{
+  "entities": {
+    "center": {
+      "title": "Center",
+      "description": "Financial unit or center representing a department or location.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "budget": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "budget"]
+    },
+    "expense": {
+      "title": "Expense",
+      "description": "A single financial transaction record.",
+      "type": "object",
+      "properties": {
+        "merchant": { "type": "string" },
+        "amount": { "type": "number" },
+        "category": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["Pending", "Approved", "Declined", "Reimbursed"] },
+        "description": { "type": "string" },
+        "centerId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["merchant", "amount", "category", "date", "status", "centerId"]
+    },
+    "profile": {
+      "title": "User Profile",
+      "description": "User specific settings and metadata.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "email": { "type": "string" },
+        "activeCenterId": { "type": "string" },
+        "theme": { "type": "string", "enum": ["light", "dark"] }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}/centers/{centerId}": {
+      "schema": "center",
+      "description": "User's financial centers."
+    },
+    "/users/{userId}/expenses/{expenseId}": {
+      "schema": "expense",
+      "description": "User's recorded expenses."
+    },
+    "/users/{userId}/profile/settings": {
+      "schema": "profile",
+      "description": "User's profile and application settings."
+    }
+  }
+}

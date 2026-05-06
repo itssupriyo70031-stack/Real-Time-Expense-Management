@@ -19,6 +19,18 @@ import { format, subDays, startOfDay, parseISO } from 'date-fns';
 import { Expense, ExpenseCategory, SpendingInsight, Center, ExpenseStatus } from './types';
 import { getSpendingInsights } from './lib/gemini';
 import { cn, formatCurrency } from './lib/utils';
+import { db, handleFirestoreError, OperationType } from './lib/firebase';
+import { 
+  collection, 
+  query, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  updateDoc, 
+  serverTimestamp, 
+  Timestamp
+} from 'firebase/firestore';
 
 // Mock initial data
 const INITIAL_CENTERS: Center[] = [
@@ -34,17 +46,15 @@ const INITIAL_EXPENSES: Expense[] = [
 ];
 
 export default function App() {
-  const [centers, setCenters] = useState<Center[]>(() => {
-    const saved = localStorage.getItem('centers');
-    return saved ? JSON.parse(saved) : INITIAL_CENTERS;
+  const [centers, setCenters] = useState<Center[]>([]);
+  const [activeCenterId, setActiveCenterId] = useState<string>('');
+  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [userProfile, setUserProfile] = useState({
+    name: 'Felix Henderson',
+    role: 'Head of Operations',
+    email: 'felix@enterprise.co'
   });
-  const [activeCenterId, setActiveCenterId] = useState<string>(() => {
-    return localStorage.getItem('activeCenterId') || centers[0]?.id || '';
-  });
-  const [expenses, setExpenses] = useState<Expense[]>(() => {
-    const saved = localStorage.getItem('expenses');
-    return saved ? JSON.parse(saved) : INITIAL_EXPENSES;
-  });
+  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -56,21 +66,101 @@ export default function App() {
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportKey, setExportKey] = useState('');
   const [centerToEdit, setCenterToEdit] = useState<Center | null>(null);
-  
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    root.classList.remove('light', 'dark');
+    root.classList.add(theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    const next = theme === 'light' ? 'dark' : 'light';
+    setTheme(next);
+    const path = `shared_ledger/global_instance/profile/settings`;
+    updateDoc(doc(db, path), { theme: next }).catch(e => handleFirestoreError(e, OperationType.UPDATE, path));
+  }
+
+  useEffect(() => {
+    const rootPath = `shared_ledger/global_instance`;
+    
+    const centersPath = `${rootPath}/centers`;
+    const unsubCenters = onSnapshot(query(collection(db, centersPath)), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Center));
+      if (data.length === 0 && centers.length === 0) {
+        // Init with default data if empty
+        INITIAL_CENTERS.forEach(async (c) => {
+          await setDoc(doc(db, `${centersPath}/${c.id}`), { name: c.name, budget: c.budget, createdAt: serverTimestamp() });
+        });
+      }
+      setCenters(data);
+    }, (error) => handleFirestoreError(error, OperationType.GET, centersPath));
+
+    const expensesPath = `${rootPath}/expenses`;
+    const unsubExpenses = onSnapshot(query(collection(db, expensesPath)), (snapshot) => {
+      const data = snapshot.docs.map(doc => {
+        const d = doc.data();
+        return { 
+          id: doc.id, 
+          ...d,
+          date: d.date instanceof Timestamp ? d.date.toDate().toISOString() : d.date
+        } as Expense;
+      });
+      if (data.length === 0 && expenses.length === 0) {
+        INITIAL_EXPENSES.forEach(async (e) => {
+          await setDoc(doc(db, `${expensesPath}/${e.id}`), { ...e, date: Timestamp.fromDate(new Date(e.date)), createdAt: serverTimestamp() });
+        });
+      }
+      setExpenses(data);
+    }, (error) => handleFirestoreError(error, OperationType.GET, expensesPath));
+
+    const profilePath = `${rootPath}/profile/settings`;
+    const unsubProfile = onSnapshot(doc(db, profilePath), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setUserProfile({
+          name: data.name || 'Felix Henderson',
+          role: data.role || 'Head of Operations',
+          email: data.email || 'felix@enterprise.co'
+        });
+        if (data.activeCenterId && !activeCenterId) setActiveCenterId(data.activeCenterId);
+        if (data.theme) setTheme(data.theme);
+      } else {
+        const initialProfile = {
+          name: 'Felix Henderson',
+          role: 'Head of Operations',
+          email: 'felix@enterprise.co',
+          theme: 'dark',
+          activeCenterId: 'c1'
+        };
+        setDoc(doc(db, profilePath), initialProfile).catch(e => handleFirestoreError(e, OperationType.WRITE, profilePath));
+        setUserProfile(initialProfile);
+        setActiveCenterId('c1');
+      }
+    }, (error) => handleFirestoreError(error, OperationType.GET, profilePath));
+
+    return () => {
+      unsubCenters();
+      unsubExpenses();
+      unsubProfile();
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 1024) setIsSidebarOpen(false);
+      else setIsSidebarOpen(true);
+    };
+    window.addEventListener('resize', handleResize);
+    handleResize();
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
   const activeCenter = useMemo(() => 
     centers.find(c => c.id === activeCenterId) || centers[0], 
   [centers, activeCenterId]);
 
   const totalBudget = activeCenter?.budget || 0;
   const [tempBudget, setTempBudget] = useState(totalBudget.toString());
-  const [userProfile, setUserProfile] = useState(() => {
-    const saved = localStorage.getItem('userProfile');
-    return saved ? JSON.parse(saved) : {
-      name: 'Felix Henderson',
-      role: 'Head of Operations',
-      email: 'felix@enterprise.co'
-    };
-  });
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [tempProfile, setTempProfile] = useState(userProfile);
   const [newCenterName, setNewCenterName] = useState('');
@@ -81,90 +171,80 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [sortConfig, setSortConfig] = useState<{ key: keyof Expense; direction: 'asc' | 'desc' } | null>(null);
   const [currentView, setCurrentView] = useState<'Dashboard' | 'Activity' | 'Settings'>('Dashboard');
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
-    const saved = localStorage.getItem('theme');
-    return (saved as 'light' | 'dark') || 'dark';
-  });
 
   useEffect(() => {
-    const root = window.document.documentElement;
-    root.classList.remove('light', 'dark');
-    root.classList.add(theme);
-    localStorage.setItem('theme', theme);
-  }, [theme]);
-
-  const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
+    if (!activeCenterId) return;
+    const path = `shared_ledger/global_instance/profile/settings`;
+    updateDoc(doc(db, path), { activeCenterId }).catch(e => handleFirestoreError(e, OperationType.UPDATE, path));
+  }, [activeCenterId]);
 
   const handleSetBudget = () => {
     setShowBudgetModal(true);
     setTempBudget(totalBudget.toString());
   };
 
-  const saveBudget = (e: React.FormEvent) => {
+  const saveBudget = async (e: React.FormEvent) => {
     e.preventDefault();
     const val = parseFloat(tempBudget);
     if (!isNaN(val) && val >= 0 && activeCenterId) {
-      setCenters(prev => prev.map(c => c.id === activeCenterId ? { ...c, budget: val } : c));
-      setShowBudgetModal(false);
+      const path = `shared_ledger/global_instance/centers/${activeCenterId}`;
+      try {
+        await updateDoc(doc(db, path), { budget: val });
+        setShowBudgetModal(false);
+      } catch (e) {
+        handleFirestoreError(e, OperationType.UPDATE, path);
+      }
     }
   };
 
-  useEffect(() => {
-    localStorage.setItem('centers', JSON.stringify(centers));
-  }, [centers]);
-
-  useEffect(() => {
-    localStorage.setItem('expenses', JSON.stringify(expenses));
-  }, [expenses]);
-
-  useEffect(() => {
-    localStorage.setItem('activeCenterId', activeCenterId);
-  }, [activeCenterId]);
-
-  useEffect(() => {
-    localStorage.setItem('userProfile', JSON.stringify(userProfile));
-  }, [userProfile]);
-
-  useEffect(() => {
-    const handleResize = () => {
-      if (window.innerWidth < 1024) {
-        setIsSidebarOpen(false);
-      } else {
-        setIsSidebarOpen(true);
-      }
-    };
-    window.addEventListener('resize', handleResize);
-    handleResize();
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
-  const handleAddCenter = (e: React.FormEvent) => {
+  const handleAddCenter = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCenterName) return;
-    const center: Center = {
-      id: Math.random().toString(36).substr(2, 9),
-      name: newCenterName,
-      budget: Number(newCenterBudget)
-    };
-    setCenters([...centers, center]);
-    setActiveCenterId(center.id);
-    setShowCenterModal(false);
-    setNewCenterName('');
+    const centerId = Math.random().toString(36).substr(2, 9);
+    const path = `shared_ledger/global_instance/centers/${centerId}`;
+    try {
+      await setDoc(doc(db, path), {
+        name: newCenterName,
+        budget: Number(newCenterBudget),
+        createdAt: serverTimestamp()
+      });
+      setActiveCenterId(centerId);
+      setShowCenterModal(false);
+      setNewCenterName('');
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, path);
+    }
   };
 
-  const handleUpdateCenter = (e: React.FormEvent) => {
+  const handleUpdateCenter = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!centerToEdit) return;
-
-    setCenters(prev => prev.map(c => c.id === centerToEdit.id ? centerToEdit : c));
-    setShowEditCenterModal(false);
-    setCenterToEdit(null);
+    const path = `shared_ledger/global_instance/centers/${centerToEdit.id}`;
+    try {
+      await updateDoc(doc(db, path), {
+        name: centerToEdit.name,
+        budget: centerToEdit.budget
+      });
+      setShowEditCenterModal(false);
+      setCenterToEdit(null);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.UPDATE, path);
+    }
   };
 
-  const handleUpdateProfile = (e: React.FormEvent) => {
+  const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    setUserProfile(tempProfile);
-    setShowProfileModal(false);
+    const path = `shared_ledger/global_instance/profile/settings`;
+    try {
+      await updateDoc(doc(db, path), {
+        name: tempProfile.name,
+        role: tempProfile.role,
+        email: tempProfile.email
+      });
+      setShowProfileModal(false);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.UPDATE, path);
+    }
   };
 
   const handleDeleteCenter = (id: string) => {
@@ -174,21 +254,27 @@ export default function App() {
     setShowDeleteModal(true);
   };
 
-  const confirmDeleteCenter = () => {
+  const confirmDeleteCenter = async () => {
     if (!centerToDelete) return;
     const id = centerToDelete.id;
+    const path = `shared_ledger/global_instance/centers/${id}`;
     
-    setCenters(prev => {
-      const updated = prev.filter(c => c.id !== id);
+    try {
+      await deleteDoc(doc(db, path));
       if (activeCenterId === id) {
-        setActiveCenterId(updated[0]?.id || '');
+        setActiveCenterId(centers.find(c => c.id !== id)?.id || '');
       }
-      return updated;
-    });
-    
-    setExpenses(prev => prev.filter(e => e.centerId !== id));
-    setShowDeleteModal(false);
-    setCenterToDelete(null);
+      
+      const centerExpenses = expenses.filter(e => e.centerId === id);
+      for (const exp of centerExpenses) {
+        await deleteDoc(doc(db, `shared_ledger/global_instance/expenses/${exp.id}`));
+      }
+      
+      setShowDeleteModal(false);
+      setCenterToDelete(null);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, path);
+    }
   };
 
   // New Expense State
@@ -250,31 +336,35 @@ export default function App() {
     }
   }, [selectedDate]);
 
-  const handleAddExpense = (e: React.FormEvent) => {
+  const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newExpense.merchant || !newExpense.amount || !activeCenterId) return;
 
-    const expense: Expense = {
-      id: Math.random().toString(36).substr(2, 9),
-      merchant: newExpense.merchant,
-      amount: Number(newExpense.amount),
-      category: newExpense.category as ExpenseCategory,
-      date: newExpense.date ? new Date(newExpense.date).toISOString() : new Date().toISOString(),
-      status: 'Pending',
-      description: newExpense.description,
-      centerId: activeCenterId,
-    };
-
-    setExpenses([expense, ...expenses]);
-    setShowAddModal(false);
-    setNewExpense({ 
-      merchant: '', 
-      amount: 0, 
-      category: 'Other', 
-      status: 'Pending',
-      date: format(new Date(), 'yyyy-MM-dd'),
-      description: ''
-    });
+    const expenseId = Math.random().toString(36).substr(2, 9);
+    const path = `shared_ledger/global_instance/expenses/${expenseId}`;
+    try {
+      await setDoc(doc(db, path), {
+        merchant: newExpense.merchant,
+        amount: Number(newExpense.amount),
+        category: newExpense.category as ExpenseCategory,
+        date: Timestamp.fromDate(newExpense.date ? new Date(newExpense.date) : new Date()),
+        status: 'Pending',
+        description: newExpense.description || '',
+        centerId: activeCenterId,
+        createdAt: serverTimestamp()
+      });
+      setShowAddModal(false);
+      setNewExpense({ 
+        merchant: '', 
+        amount: 0, 
+        category: 'Other', 
+        status: 'Pending',
+        date: format(new Date(), 'yyyy-MM-dd'),
+        description: ''
+      });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, path);
+    }
   };
 
   const filteredExpenses = useMemo(() => {
@@ -321,15 +411,27 @@ export default function App() {
     setSelectedIds(next);
   };
 
-  const handleBulkAction = (status: ExpenseStatus) => {
-    setExpenses(prev => prev.map(e => 
-      selectedIds.has(e.id) ? { ...e, status } : e
-    ));
+  const handleBulkAction = async (status: ExpenseStatus) => {
+    for (const id of selectedIds) {
+      const path = `shared_ledger/global_instance/expenses/${id}`;
+      try {
+        await updateDoc(doc(db, path), { status });
+      } catch (e) {
+        handleFirestoreError(e, OperationType.UPDATE, path);
+      }
+    }
     setSelectedIds(new Set());
   };
 
-  const handleBulkDelete = () => {
-    setExpenses(prev => prev.filter(e => !selectedIds.has(e.id)));
+  const handleBulkDelete = async () => {
+    for (const id of selectedIds) {
+      const path = `shared_ledger/global_instance/expenses/${id}`;
+      try {
+        await deleteDoc(doc(db, path));
+      } catch (e) {
+        handleFirestoreError(e, OperationType.DELETE, path);
+      }
+    }
     setSelectedIds(new Set());
   };
 
@@ -384,6 +486,7 @@ export default function App() {
       alert('Export failed. Please check console for details.');
     }
   };
+
 
   return (
     <div className="flex h-screen bg-[var(--app-bg)] text-[var(--app-text)] font-sans overflow-hidden">
@@ -479,7 +582,9 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-[var(--app-border)]">
-          <NavItem icon={<LogOut size={20} />} label="Log out" isSidebarOpen={isSidebarOpen} />
+          <div className="px-4 py-2 text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-widest text-center opacity-50">
+            Global Sync Active
+          </div>
         </div>
       </aside>
 
