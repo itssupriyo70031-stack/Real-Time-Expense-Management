@@ -1,0 +1,45 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  :root {
+    --app-bg: #fcfcfc;
+    --app-surface: #ffffff;
+    --app-header: #ffffff;
+    --app-sidebar: #f8f8f8;
+    --app-border: #eeeeee;
+    --app-inner-border: #e5e5e5;
+    --app-text: #09090b;
+    --app-muted: #71717a;
+    --app-hover: #f4f4f5;
+    --app-accent: #18181b;
+    --app-accent-foreground: #ffffff;
+    --app-card-shadow: 0 4px 20px rgba(0,0,0,0.05);
+  }
+
+  .dark {
+    --app-bg: #080808;
+    --app-surface: #0f0f0f;
+    --app-header: #0a0a0a;
+    --app-sidebar: #0a0a0a;
+    --app-border: #1f1f1f;
+    --app-inner-border: #262626;
+    --app-text: #d4d4d8;
+    --app-muted: #71717a;
+    --app-hover: #141414;
+    --app-accent: #fafafa;
+    --app-accent-foreground: #18181b;
+    --app-card-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  }
+
+  body {
+    background-color: var(--app-bg);
+    color: var(--app-text);
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+}
