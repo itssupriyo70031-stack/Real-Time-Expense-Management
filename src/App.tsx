@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Building2, Plus, Search, LayoutDashboard, History, Settings, Bell, User, ArrowUpRight, TrendingDown, Sparkles, Receipt, CheckCircle2, Clock, LogOut, ChevronRight, ChevronDown, ChevronUp, AlertCircle, XCircle, Menu, X, Trash2, Sun, Moon, Wallet, Lock, CreditCard, BarChart3, Calendar } from 'lucide-react';
 import { 
@@ -86,12 +86,6 @@ export default function App() {
     const centersPath = `${rootPath}/centers`;
     const unsubCenters = onSnapshot(query(collection(db, centersPath)), (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Center));
-      if (data.length === 0 && centers.length === 0) {
-        // Init with default data if empty
-        INITIAL_CENTERS.forEach(async (c) => {
-          await setDoc(doc(db, `${centersPath}/${c.id}`), { name: c.name, budget: c.budget, createdAt: serverTimestamp() });
-        });
-      }
       setCenters(data);
     }, (error) => handleFirestoreError(error, OperationType.GET, centersPath));
 
@@ -105,11 +99,6 @@ export default function App() {
           date: d.date instanceof Timestamp ? d.date.toDate().toISOString() : d.date
         } as Expense;
       });
-      if (data.length === 0 && expenses.length === 0) {
-        INITIAL_EXPENSES.forEach(async (e) => {
-          await setDoc(doc(db, `${expensesPath}/${e.id}`), { ...e, date: Timestamp.fromDate(new Date(e.date)), createdAt: serverTimestamp() });
-        });
-      }
       setExpenses(data);
     }, (error) => handleFirestoreError(error, OperationType.GET, expensesPath));
 
@@ -125,6 +114,7 @@ export default function App() {
         if (data.activeCenterId && !activeCenterId) setActiveCenterId(data.activeCenterId);
         if (data.theme) setTheme(data.theme);
       } else {
+        // First time setup - seeds the database once
         const initialProfile = {
           name: 'Felix Henderson',
           role: 'Head of Operations',
@@ -132,7 +122,28 @@ export default function App() {
           theme: 'dark',
           activeCenterId: 'c1'
         };
+        
+        // Write profile
         setDoc(doc(db, profilePath), initialProfile).catch(e => handleFirestoreError(e, OperationType.WRITE, profilePath));
+        
+        // Seed default centers
+        INITIAL_CENTERS.forEach(c => {
+          setDoc(doc(db, `${centersPath}/${c.id}`), { 
+            name: c.name, 
+            budget: c.budget, 
+            createdAt: Timestamp.now() 
+          });
+        });
+
+        // Seed default expenses
+        INITIAL_EXPENSES.forEach(e => {
+          setDoc(doc(db, `${expensesPath}/${e.id}`), { 
+            ...e, 
+            date: Timestamp.fromDate(new Date(e.date)), 
+            createdAt: Timestamp.now() 
+          });
+        });
+
         setUserProfile(initialProfile);
         setActiveCenterId('c1');
       }
@@ -336,34 +347,58 @@ export default function App() {
     }
   }, [selectedDate]);
 
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newExpense.merchant || !newExpense.amount || !activeCenterId) return;
+    if (isSubmitting) return;
 
-    const expenseId = Math.random().toString(36).substr(2, 9);
-    const path = `shared_ledger/global_instance/expenses/${expenseId}`;
+    // Determine the target center ID
+    const currentCenterId = activeCenterId || centers[0]?.id;
+    
+    if (!newExpense.merchant || !currentCenterId) return;
+
+    setIsSubmitting(true);
+    
     try {
-      await setDoc(doc(db, path), {
-        merchant: newExpense.merchant,
-        amount: Number(newExpense.amount),
-        category: newExpense.category as ExpenseCategory,
-        date: Timestamp.fromDate(newExpense.date ? new Date(newExpense.date) : new Date()),
-        status: 'Pending',
-        description: newExpense.description || '',
-        centerId: activeCenterId,
-        createdAt: serverTimestamp()
-      });
+      const expenseId = Math.random().toString(36).substr(2, 9);
+      const path = `shared_ledger/global_instance/expenses/${expenseId}`;
+      
+      // Validate date
+      let expenseDate = new Date();
+      if (newExpense.date) {
+        const d = new Date(newExpense.date);
+        if (!isNaN(d.getTime())) {
+          expenseDate = d;
+        }
+      }
+
+      const expenseData = {
+        merchant: String(newExpense.merchant).trim(),
+        amount: Number(newExpense.amount) || 0,
+        category: String(newExpense.category),
+        date: Timestamp.fromDate(expenseDate),
+        status: String(newExpense.status || 'Pending'),
+        description: String(newExpense.description || '').trim(),
+        centerId: String(currentCenterId),
+        createdAt: Timestamp.now()
+      };
+
+      await setDoc(doc(db, path), expenseData);
+      
       setShowAddModal(false);
       setNewExpense({ 
         merchant: '', 
         amount: 0, 
-        category: 'Other', 
+        category: 'Travel', 
         status: 'Pending',
         date: format(new Date(), 'yyyy-MM-dd'),
         description: ''
       });
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, path);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `shared_ledger/global_instance/expenses`);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -396,43 +431,53 @@ export default function App() {
     setSortConfig({ key, direction });
   };
 
-  const toggleSelectAll = () => {
-    if (selectedIds.size === filteredExpenses.length) {
+  const toggleSelectAll = useCallback(() => {
+    if (selectedIds.size > 0 && selectedIds.size === filteredExpenses.length) {
       setSelectedIds(new Set());
     } else {
       setSelectedIds(new Set(filteredExpenses.map(e => e.id)));
     }
-  };
+  }, [selectedIds.size, filteredExpenses]);
 
-  const toggleSelect = (id: string) => {
-    const next = new Set(selectedIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setSelectedIds(next);
-  };
+  const toggleSelect = useCallback((id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   const handleBulkAction = async (status: ExpenseStatus) => {
-    for (const id of selectedIds) {
-      const path = `shared_ledger/global_instance/expenses/${id}`;
-      try {
-        await updateDoc(doc(db, path), { status });
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, path);
-      }
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+
+    try {
+      const promises = ids.map(id => {
+        const path = `shared_ledger/global_instance/expenses/${id}`;
+        return updateDoc(doc(db, path), { status });
+      });
+      await Promise.all(promises);
+      setSelectedIds(new Set());
+    } catch (e) {
+      handleFirestoreError(e, OperationType.UPDATE, `shared_ledger/global_instance/expenses`);
     }
-    setSelectedIds(new Set());
   };
 
   const handleBulkDelete = async () => {
-    for (const id of selectedIds) {
-      const path = `shared_ledger/global_instance/expenses/${id}`;
-      try {
-        await deleteDoc(doc(db, path));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, path);
-      }
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+
+    try {
+      const promises = ids.map(id => {
+        const path = `shared_ledger/global_instance/expenses/${id}`;
+        return deleteDoc(doc(db, path));
+      });
+      await Promise.all(promises);
+      setSelectedIds(new Set());
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, `shared_ledger/global_instance/expenses`);
     }
-    setSelectedIds(new Set());
   };
 
   const handleExportCSV = () => {
@@ -1255,9 +1300,17 @@ export default function App() {
                 <div className="pt-6">
                   <button 
                     type="submit"
-                    className="w-full bg-[var(--app-accent)] hover:opacity-90 text-[var(--app-accent-foreground)] font-bold py-5 rounded-2xl uppercase tracking-[0.2em] text-xs transition-all active:scale-[0.98] shadow-sm"
+                    disabled={isSubmitting}
+                    className="w-full bg-[var(--app-accent)] hover:opacity-90 disabled:opacity-50 text-[var(--app-accent-foreground)] font-bold py-5 rounded-2xl uppercase tracking-[0.2em] text-xs transition-all active:scale-[0.98] shadow-sm flex items-center justify-center gap-3"
                   >
-                    Commit Transaction
+                    {isSubmitting ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-black/20 border-t-black rounded-full animate-spin"></div>
+                        Syncing...
+                      </>
+                    ) : (
+                      'Commit Transaction'
+                    )}
                   </button>
                 </div>
               </form>
