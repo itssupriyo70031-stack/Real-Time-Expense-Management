@@ -180,6 +180,8 @@ export default function App() {
   const [isInsightsLoading, setIsInsightsLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState<Expense['status'] | 'All'>('All');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
   const [sortConfig, setSortConfig] = useState<{ key: keyof Expense; direction: 'asc' | 'desc' } | null>(null);
   const [currentView, setCurrentView] = useState<'Dashboard' | 'Activity' | 'Settings'>('Dashboard');
 
@@ -468,6 +470,7 @@ export default function App() {
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return;
 
+    setIsBulkDeleting(true);
     try {
       const promises = ids.map(id => {
         const path = `shared_ledger/global_instance/expenses/${id}`;
@@ -475,8 +478,11 @@ export default function App() {
       });
       await Promise.all(promises);
       setSelectedIds(new Set());
+      setShowBulkDeleteConfirm(false);
     } catch (e) {
       handleFirestoreError(e, OperationType.DELETE, `shared_ledger/global_instance/expenses`);
+    } finally {
+      setIsBulkDeleting(false);
     }
   };
 
@@ -819,7 +825,7 @@ export default function App() {
                       setStatusFilter={setStatusFilter}
                       onAddClick={() => setShowAddModal(true)}
                       handleBulkAction={handleBulkAction}
-                      handleBulkDelete={handleBulkDelete}
+                      handleBulkDelete={() => setShowBulkDeleteConfirm(true)}
                       onDeselectAll={() => setSelectedIds(new Set())}
                     />
                   </div>
@@ -899,7 +905,7 @@ export default function App() {
                   setStatusFilter={setStatusFilter}
                   onAddClick={() => setShowAddModal(true)}
                   handleBulkAction={handleBulkAction}
-                  handleBulkDelete={handleBulkDelete}
+                  handleBulkDelete={() => setShowBulkDeleteConfirm(true)}
                   onDeselectAll={() => setSelectedIds(new Set())}
                   title="Recorded Transactions"
                 />
@@ -1140,6 +1146,68 @@ export default function App() {
                   className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-4 rounded-xl uppercase tracking-[0.2em] text-[10px] transition-all active:scale-[0.98]"
                 >
                   Confirm Delete
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {showBulkDeleteConfirm && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isBulkDeleting && setShowBulkDeleteConfirm(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-[var(--app-surface)] rounded-3xl p-10 shadow-2xl border border-[var(--app-border)]"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <div className="flex items-center gap-3">
+                  <XCircle size={20} className="text-red-500" />
+                  <h2 className="text-xl font-bold text-[var(--app-text)] uppercase tracking-widest text-left">Confirm Batch Delete</h2>
+                </div>
+                <button 
+                  disabled={isBulkDeleting}
+                  onClick={() => setShowBulkDeleteConfirm(false)} 
+                  className="p-2 hover:bg-[var(--app-hover)] rounded-full text-[var(--app-muted)] transition-all disabled:opacity-50"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+              
+              <div className="mb-8 p-5 bg-red-500/10 border border-red-500/20 rounded-2xl text-left">
+                 <p className="text-[10px] font-bold text-red-500 uppercase tracking-widest mb-2">Notice: Batch Termination</p>
+                 <p className="text-xs text-red-500/80 leading-relaxed font-medium">
+                  Are you sure you want to delete <span className="font-bold text-white">{selectedIds.size}</span> selected transactions? 
+                  This will permanently erase these records from the database. This action cannot be reversed.
+                 </p>
+              </div>
+
+              <div className="flex gap-4">
+                <button 
+                  disabled={isBulkDeleting}
+                  onClick={() => setShowBulkDeleteConfirm(false)}
+                  className="flex-1 px-4 py-4 border border-[var(--app-inner-border)] rounded-xl text-[10px] font-bold uppercase tracking-widest text-[var(--app-text)] hover:bg-[var(--app-hover)] transition-all disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button 
+                  disabled={isBulkDeleting}
+                  onClick={handleBulkDelete}
+                  className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-4 rounded-xl uppercase tracking-[0.2em] text-[10px] transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {isBulkDeleting ? (
+                    <>
+                      <div className="w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></div>
+                      Processing...
+                    </>
+                  ) : 'Confirm Delete'}
                 </button>
               </div>
             </motion.div>
