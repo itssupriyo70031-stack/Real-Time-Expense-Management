@@ -22,6 +22,7 @@ export interface Expense {
   status: ExpenseStatus;
   description?: string;
   centerId: string;
+  billUrl?: string;
 }
 
 export interface SpendingInsight {

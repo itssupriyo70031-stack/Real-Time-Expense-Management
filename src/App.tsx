@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Building2, Plus, Search, LayoutDashboard, History, Settings, Bell, User, ArrowUpRight, TrendingDown, Sparkles, Receipt, CheckCircle2, Clock, LogOut, ChevronRight, ChevronDown, ChevronUp, AlertCircle, XCircle, Menu, X, Trash2, Sun, Moon, Wallet, Lock, CreditCard, BarChart3, Calendar } from 'lucide-react';
+import { Building2, Plus, Search, LayoutDashboard, History, Settings, Bell, User, ArrowUpRight, TrendingDown, Sparkles, Receipt, CheckCircle2, Clock, LogOut, ChevronRight, ChevronDown, ChevronUp, AlertCircle, XCircle, Menu, X, Trash2, Sun, Moon, Wallet, Lock, CreditCard, BarChart3, Calendar, Image as ImageIcon, Download, Eye, FileText, Upload } from 'lucide-react';
 import { 
   AreaChart, 
   Area, 
@@ -16,6 +16,8 @@ import {
   ResponsiveContainer 
 } from 'recharts';
 import { format, subDays, startOfDay, parseISO } from 'date-fns';
+import JSZip from 'jszip';
+import { saveAs } from 'file-saver';
 import { Expense, ExpenseCategory, SpendingInsight, Center, ExpenseStatus } from './types';
 import { getSpendingInsights } from './lib/gemini';
 import { cn, formatCurrency } from './lib/utils';
@@ -31,6 +33,18 @@ import {
   serverTimestamp, 
   Timestamp
 } from 'firebase/firestore';
+
+// API key is handled by the environment
+
+const EXPENSE_CATEGORIES: ExpenseCategory[] = [
+  'Food & Beverage',
+  'Travel',
+  'Software/SaaS',
+  'Office',
+  'Marketing',
+  'Entertainment',
+  'Other'
+];
 
 // Mock initial data
 const INITIAL_CENTERS: Center[] = [
@@ -96,6 +110,7 @@ export default function App() {
         return { 
           id: doc.id, 
           ...d,
+          amount: Number(d.amount) || 0,
           date: d.date instanceof Timestamp ? d.date.toDate().toISOString() : d.date
         } as Expense;
       });
@@ -183,7 +198,55 @@ export default function App() {
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
   const [sortConfig, setSortConfig] = useState<{ key: keyof Expense; direction: 'asc' | 'desc' } | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
   const [currentView, setCurrentView] = useState<'Dashboard' | 'Activity' | 'Settings'>('Dashboard');
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
+  const [editForm, setEditForm] = useState<Partial<Expense>>({});
+  const [billPreview, setBillPreview] = useState<string | null>(null);
+  const [selectedBill, setSelectedBill] = useState<string | null>(null);
+  const [showBillModal, setShowBillModal] = useState(false);
+
+  const handleEditExpense = (expense: Expense) => {
+    setEditingExpense(expense);
+    setEditForm({
+      merchant: expense.merchant,
+      amount: expense.amount,
+      category: expense.category,
+      date: expense.date,
+      status: expense.status,
+      description: expense.description || ''
+    });
+    setBillPreview(expense.billUrl || null);
+    setShowEditModal(true);
+  };
+
+  const handleUpdateExpense = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingExpense || isSubmitting) return;
+
+    setIsSubmitting(true);
+    try {
+      const path = `shared_ledger/global_instance/expenses/${editingExpense.id}`;
+      
+      const updatedData = {
+        ...editForm,
+        merchant: String(editForm.merchant).trim(),
+        amount: parseFloat(String(editForm.amount)) || 0,
+        description: String(editForm.description || '').trim(),
+        billUrl: billPreview || undefined,
+        updatedAt: Timestamp.now()
+      };
+
+      await setDoc(doc(db, path), updatedData, { merge: true });
+      setShowEditModal(false);
+      setEditingExpense(null);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `shared_ledger/global_instance/expenses`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     if (!activeCenterId) return;
@@ -377,18 +440,20 @@ export default function App() {
 
       const expenseData = {
         merchant: String(newExpense.merchant).trim(),
-        amount: Number(newExpense.amount) || 0,
+        amount: parseFloat(String(newExpense.amount)) || 0,
         category: String(newExpense.category),
         date: Timestamp.fromDate(expenseDate),
         status: String(newExpense.status || 'Pending'),
         description: String(newExpense.description || '').trim(),
         centerId: String(currentCenterId),
+        billUrl: billPreview || undefined,
         createdAt: Timestamp.now()
       };
 
       await setDoc(doc(db, path), expenseData);
       
       setShowAddModal(false);
+      setBillPreview(null);
       setNewExpense({ 
         merchant: '', 
         amount: 0, 
@@ -491,22 +556,36 @@ export default function App() {
     setExportKey('');
   };
 
-  const handleConfirmExport = (e: React.FormEvent) => {
+  const handleConfirmExport = async (e: React.FormEvent) => {
     e.preventDefault();
     if (exportKey !== 'RIYANKANJILAL') {
       alert('Unauthorized access key. Incident logged.');
       return;
     }
 
+    setIsExporting(true);
     try {
-      const headers = ['Center', 'Merchant', 'Date', 'Amount (INR)', 'Category', 'Status', 'Description'];
-      const csvRows = expenses.map(e => {
+      const zip = new JSZip();
+      const imgFolder = zip.folder("receipts");
+      
+      const headers = ['Center', 'Merchant', 'Date', 'Amount (INR)', 'Category', 'Status', 'Description', 'Receipt Filename'];
+      const csvRows = expenses.map((e, index) => {
         const centerName = centers.find(c => c.id === e.centerId)?.name || 'Unknown';
         let formattedDate = 'N/A';
         try {
           formattedDate = format(parseISO(e.date), 'yyyy-MM-dd');
         } catch (err) {
           formattedDate = e.date;
+        }
+
+        let receiptFilename = 'None';
+        if (e.billUrl) {
+          receiptFilename = `receipt_${index + 1}_${e.merchant.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.png`;
+          // Extract base64 part
+          const base64Data = e.billUrl.split(',')[1];
+          if (base64Data) {
+            imgFolder?.file(receiptFilename, base64Data, { base64: true });
+          }
         }
 
         return [
@@ -516,25 +595,24 @@ export default function App() {
           e.amount,
           `"${e.category}"`,
           `"${e.status}"`,
-          `"${(e.description || '').replace(/"/g, '""')}"`
+          `"${(e.description || '').replace(/"/g, '""')}"`,
+          `"${receiptFilename}"`
         ].join(',');
       });
 
       const csvContent = [headers.join(','), ...csvRows].join('\n');
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const link = document.createElement('a');
-      const url = URL.createObjectURL(blob);
-      link.setAttribute('href', url);
-      link.setAttribute('download', `financial_ledger_${format(new Date(), 'yyyy-MM-dd')}.csv`);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      zip.file(`financial_ledger_${format(new Date(), 'yyyy-MM-dd')}.csv`, csvContent);
+
+      const content = await zip.generateAsync({ type: "blob" });
+      saveAs(content, `financial_export_bundle_${format(new Date(), 'yyyy-MM-dd')}.zip`);
+      
       setShowExportModal(false);
+      setIsExporting(false);
+      setExportKey('');
     } catch (error) {
       console.error('Export failed:', error);
       alert('Export failed. Please check console for details.');
+      setIsExporting(false);
     }
   };
 
@@ -827,6 +905,11 @@ export default function App() {
                       handleBulkAction={handleBulkAction}
                       handleBulkDelete={() => setShowBulkDeleteConfirm(true)}
                       onDeselectAll={() => setSelectedIds(new Set())}
+                      onViewBill={(url) => {
+                        setSelectedBill(url);
+                        setShowBillModal(true);
+                      }}
+                      onEdit={handleEditExpense}
                     />
                   </div>
 
@@ -907,6 +990,11 @@ export default function App() {
                   handleBulkAction={handleBulkAction}
                   handleBulkDelete={() => setShowBulkDeleteConfirm(true)}
                   onDeselectAll={() => setSelectedIds(new Set())}
+                  onViewBill={(url) => {
+                    setSelectedBill(url);
+                    setShowBillModal(true);
+                  }}
+                  onEdit={handleEditExpense}
                   title="Recorded Transactions"
                 />
               )}
@@ -1259,9 +1347,15 @@ export default function App() {
                 </div>
                 <button 
                   type="submit"
-                  className="w-full bg-white hover:bg-zinc-200 text-black font-bold py-5 rounded-2xl uppercase tracking-[0.2em] text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                  disabled={isExporting}
+                  className="w-full bg-white hover:bg-zinc-200 text-black font-bold py-5 rounded-2xl uppercase tracking-[0.2em] text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-50"
                 >
-                  Confirm Authorization
+                  {isExporting ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-black/20 border-t-black rounded-full animate-spin"></div>
+                      Packaging Bundle...
+                    </>
+                  ) : 'Confirm Authorization'}
                 </button>
               </form>
             </motion.div>
@@ -1297,11 +1391,11 @@ export default function App() {
 
               <form onSubmit={handleAddExpense} className="space-y-8">
                 <div className="space-y-3">
-                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Asset Name / Merchant</label>
+                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Transaction Merchant / Entity</label>
                   <input 
                     required
                     type="text" 
-                    placeholder="Reference..."
+                    placeholder="e.g. AWS, Swiggy, Office Rent..."
                     value={newExpense.merchant}
                     onChange={e => setNewExpense({...newExpense, merchant: e.target.value})}
                     className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-medium"
@@ -1310,14 +1404,17 @@ export default function App() {
                 
                 <div className="grid grid-cols-2 gap-6">
                   <div className="space-y-3">
-                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Quantity (INR)</label>
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Transaction Amount (INR)</label>
                     <input 
                       required
                       type="number" 
                       step="0.01"
                       placeholder="0.00"
                       value={newExpense.amount || ''}
-                      onChange={e => setNewExpense({...newExpense, amount: Number(e.target.value)})}
+                      onChange={e => {
+                        const val = e.target.value === '' ? 0 : parseFloat(e.target.value);
+                        setNewExpense({...newExpense, amount: val});
+                      }}
                       className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-mono"
                     />
                   </div>
@@ -1341,12 +1438,9 @@ export default function App() {
                       onChange={e => setNewExpense({...newExpense, category: e.target.value as ExpenseCategory})}
                       className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none appearance-none font-medium cursor-pointer pr-12"
                     >
-                      <option value="Food & Beverage">Food & Beverage</option>
-                      <option value="Travel">Travel</option>
-                      <option value="Software/SaaS">Software/SaaS</option>
-                      <option value="Office">Office</option>
-                      <option value="Marketing">Marketing</option>
-                      <option value="Other">Other</option>
+                      {EXPENSE_CATEGORIES.map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
                     </select>
                     <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none text-[var(--app-muted)]">
                       <ChevronDown size={14} />
@@ -1363,6 +1457,58 @@ export default function App() {
                     rows={3}
                     className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-medium resize-none"
                   />
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Bill Photo / Attachment</label>
+                  <div className="relative">
+                    <input 
+                      type="file" 
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) {
+                          const reader = new FileReader();
+                          reader.onloadend = () => {
+                            setBillPreview(reader.result as string);
+                          };
+                          reader.readAsDataURL(file);
+                        }
+                      }}
+                      className="hidden"
+                      id="bill-upload"
+                    />
+                    <label 
+                      htmlFor="bill-upload"
+                      className="w-full px-5 py-8 border-2 border-dashed border-[var(--app-inner-border)] rounded-2xl flex flex-col items-center justify-center gap-3 cursor-pointer hover:border-[var(--app-muted)] transition-all bg-[var(--app-bg)]/50"
+                    >
+                      {billPreview ? (
+                        <div className="relative group/bill">
+                          <img src={billPreview} className="h-32 w-auto rounded-lg shadow-lg border border-[var(--app-inner-border)]" alt="Bill preview" />
+                          <button 
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              setBillPreview(null);
+                            }}
+                            className="absolute -top-2 -right-2 p-1.5 bg-red-600 text-white rounded-full shadow-lg group-hover/bill:scale-110 transition-all"
+                          >
+                            <X size={12} />
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="p-3 bg-[var(--app-hover)] rounded-xl text-[var(--app-muted)]">
+                            <Upload size={20} />
+                          </div>
+                          <div className="text-center">
+                            <p className="text-[10px] font-bold text-[var(--app-text)] uppercase tracking-widest">Click to upload bill</p>
+                            <p className="text-[9px] text-[var(--app-muted)] font-medium mt-1 uppercase tracking-widest">Supports PNG, JPG (Max 5MB)</p>
+                          </div>
+                        </>
+                      )}
+                    </label>
+                  </div>
                 </div>
 
                 <div className="pt-6">
@@ -1446,6 +1592,248 @@ export default function App() {
                 >
                   Save Global Profile
                 </button>
+              </form>
+            </motion.div>
+          </div>
+        )}
+
+        {showBillModal && selectedBill && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowBillModal(false)}
+              className="absolute inset-0 bg-black/95 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="relative w-full max-w-4xl bg-[var(--app-surface)] rounded-[2.5rem] overflow-hidden shadow-2xl border border-[var(--app-border)]"
+            >
+              <div className="flex items-center justify-between p-8 border-b border-[var(--app-border)]">
+                <h2 className="text-xl font-bold text-[var(--app-text)] uppercase tracking-widest flex items-center gap-3">
+                  <FileText size={20} className="text-[var(--app-muted)]" />
+                  Bill Evidence Verification
+                </h2>
+                <div className="flex items-center gap-3">
+                  <a 
+                    href={selectedBill} 
+                    download="bill_receipt.png"
+                    className="p-3 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] rounded-full text-[var(--app-text)] border border-[var(--app-inner-border)] transition-all flex items-center gap-2 text-xs font-bold uppercase tracking-widest px-6"
+                  >
+                    <Download size={16} />
+                    Download
+                  </a>
+                  <button 
+                    onClick={() => setShowBillModal(false)} 
+                    className="p-3 hover:bg-[var(--app-hover)] rounded-full text-[var(--app-muted)] transition-all"
+                  >
+                    <X size={20} />
+                  </button>
+                </div>
+              </div>
+              <div className="p-8 flex items-center justify-center bg-black/40 min-h-[400px]">
+                <img 
+                  src={selectedBill} 
+                  className="max-w-full max-h-[70vh] rounded-xl shadow-2xl object-contain border border-[var(--app-border)]" 
+                  alt="Bill attachment" 
+                />
+              </div>
+              <div className="p-6 bg-[var(--app-sidebar)] border-t border-[var(--app-border)] text-center">
+                <p className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-widest">Digital Asset Hash Certified • Impartial Evidence Store</p>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {showEditModal && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isSubmitting && setShowEditModal(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-xl bg-[var(--app-surface)] rounded-[2.5rem] p-10 shadow-2xl border border-[var(--app-border)] overflow-y-auto max-h-[90vh]"
+            >
+              <div className="flex items-center justify-between mb-10">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-[var(--app-hover)] rounded-2xl text-[var(--app-muted)]">
+                    <FileText size={24} />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-[var(--app-text)] uppercase tracking-[0.2em] leading-tight">Edit Transaction</h2>
+                    <p className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-widest mt-1">Ref ID: {editingExpense?.id}</p>
+                  </div>
+                </div>
+                <button 
+                  disabled={isSubmitting}
+                  onClick={() => setShowEditModal(false)} 
+                  className="p-3 hover:bg-[var(--app-hover)] rounded-full text-[var(--app-muted)] transition-all"
+                >
+                  <X size={24} />
+                </button>
+              </div>
+
+              <form onSubmit={handleUpdateExpense} className="space-y-8">
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Transaction Merchant / Entity</label>
+                  <input 
+                    required
+                    type="text" 
+                    value={editForm.merchant || ''}
+                    onChange={e => setEditForm({...editForm, merchant: e.target.value})}
+                    className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-medium"
+                  />
+                </div>
+                
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Transaction Amount (INR)</label>
+                    <input 
+                      required
+                      type="number" 
+                      step="0.01"
+                      value={editForm.amount || ''}
+                      onChange={e => {
+                        const val = e.target.value === '' ? 0 : parseFloat(e.target.value);
+                        setEditForm({...editForm, amount: val});
+                      }}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-mono"
+                    />
+                  </div>
+                  
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Posting Date</label>
+                    <input 
+                      required
+                      type="date" 
+                      value={editForm.date || ''}
+                      onChange={e => setEditForm({...editForm, date: e.target.value})}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-medium"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Classification</label>
+                    <select 
+                      value={editForm.category}
+                      onChange={e => setEditForm({...editForm, category: e.target.value as ExpenseCategory})}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-medium appearance-none"
+                    >
+                      {EXPENSE_CATEGORIES.map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Process Status</label>
+                    <select 
+                      value={editForm.status}
+                      onChange={e => setEditForm({...editForm, status: e.target.value as Expense['status']})}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-medium appearance-none"
+                    >
+                      <option value="Pending">Pending</option>
+                      <option value="Approved">Approved</option>
+                      <option value="Declined">Declined</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Executive Summary / Description</label>
+                  <textarea 
+                    placeholder="Add specific context..."
+                    value={editForm.description || ''}
+                    onChange={e => setEditForm({...editForm, description: e.target.value})}
+                    className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] placeholder-[var(--app-muted)] focus:border-[var(--app-muted)] transition-all outline-none font-medium resize-none h-24"
+                  />
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Bill Photo / Attachment</label>
+                  <div className="relative">
+                    <input 
+                      type="file" 
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) {
+                          const reader = new FileReader();
+                          reader.onloadend = () => {
+                            setBillPreview(reader.result as string);
+                          };
+                          reader.readAsDataURL(file);
+                        }
+                      }}
+                      className="hidden"
+                      id="edit-bill-upload"
+                    />
+                    <label 
+                      htmlFor="edit-bill-upload"
+                      className="w-full px-5 py-8 border-2 border-dashed border-[var(--app-inner-border)] rounded-2xl flex flex-col items-center justify-center gap-3 cursor-pointer hover:border-[var(--app-muted)] transition-all bg-[var(--app-bg)]/50"
+                    >
+                      {billPreview ? (
+                        <div className="relative group/bill">
+                          <img src={billPreview} className="h-32 w-auto rounded-lg shadow-lg border border-[var(--app-inner-border)]" alt="Bill preview" />
+                          <button 
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              setBillPreview(null);
+                            }}
+                            className="absolute -top-2 -right-2 p-1.5 bg-red-600 text-white rounded-full shadow-lg"
+                          >
+                            <X size={12} />
+                          </button>
+                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/bill:opacity-100 flex items-center justify-center transition-all rounded-lg">
+                            <p className="text-[8px] font-bold text-white uppercase tracking-widest">Change Photo</p>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="p-3 bg-[var(--app-hover)] rounded-xl text-[var(--app-muted)]">
+                            <Upload size={20} />
+                          </div>
+                          <div className="text-center">
+                            <p className="text-[10px] font-bold text-[var(--app-text)] uppercase tracking-widest">Click to upload bill</p>
+                            <p className="text-[9px] text-[var(--app-muted)] font-medium mt-1 uppercase tracking-widest">PNG, JPG (Max 5MB)</p>
+                          </div>
+                        </>
+                      )}
+                    </label>
+                  </div>
+                </div>
+
+                <div className="pt-6">
+                  <button 
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full bg-[var(--app-muted)] hover:bg-[var(--app-text)] text-[var(--app-surface)] font-bold py-5 rounded-2xl uppercase tracking-[0.3em] text-[11px] transition-all active:scale-[0.98] shadow-xl disabled:opacity-50 flex items-center justify-center gap-3"
+                  >
+                    {isSubmitting ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-[var(--app-surface)]/20 border-t-[var(--app-surface)] rounded-full animate-spin"></div>
+                        Syncing Changes...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 size={18} />
+                        Save Modifications
+                      </>
+                    )}
+                  </button>
+                </div>
               </form>
             </motion.div>
           </div>
@@ -1594,6 +1982,8 @@ function ExpensesTable({
   handleBulkAction,
   handleBulkDelete,
   onDeselectAll,
+  onViewBill,
+  onEdit,
   title = "Real-Time Transactions"
 }: { 
   filteredExpenses: Expense[], 
@@ -1608,6 +1998,8 @@ function ExpensesTable({
   handleBulkAction: (status: Expense['status']) => void,
   handleBulkDelete: () => void,
   onDeselectAll: () => void,
+  onViewBill: (url: string) => void,
+  onEdit: (expense: Expense) => void,
   title?: string
 }) {
   return (
@@ -1731,6 +2123,7 @@ function ExpensesTable({
                   <SortIcon active={sortConfig?.key === 'amount'} direction={sortConfig?.direction} />
                 </div>
               </th>
+              <th className="px-8 py-4 text-center">Receipt</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--app-border)]">
@@ -1772,6 +2165,47 @@ function ExpensesTable({
                 </td>
                 <td className="px-8 py-5 text-right">
                   <span className="font-mono text-[var(--app-text)] text-base">{formatCurrency(expense.amount)}</span>
+                </td>
+                <td className="px-8 py-5 text-center">
+                  <div className="flex items-center justify-center gap-2">
+                    {expense.billUrl ? (
+                      <>
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onViewBill(expense.billUrl!);
+                          }}
+                          className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-accent)] transition-all flex items-center justify-center group/eye"
+                          title="View Bill Receipt"
+                        >
+                          <Eye size={16} className="transition-transform group-hover/eye:scale-110" />
+                        </button>
+                        <a 
+                          href={expense.billUrl}
+                          download={`bill_${expense.merchant.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.png`}
+                          onClick={(e) => e.stopPropagation()}
+                          className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/dl"
+                          title="Download Receipt"
+                        >
+                          <Download size={16} className="transition-transform group-hover/dl:scale-110" />
+                        </a>
+                      </>
+                    ) : (
+                      <div className="w-10 h-10 border border-dashed border-[var(--app-inner-border)] rounded-xl flex items-center justify-center opacity-40">
+                        <span className="text-[8px] font-bold text-[var(--app-muted)] uppercase">NA</span>
+                      </div>
+                    )}
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onEdit(expense);
+                      }}
+                      className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/edit"
+                      title="Edit Transaction"
+                    >
+                       <FileText size={16} className="transition-transform group-hover/edit:scale-110" />
+                    </button>
+                  </div>
                 </td>
               </motion.tr>
             ))}
