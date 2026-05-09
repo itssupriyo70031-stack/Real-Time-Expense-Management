@@ -18,7 +18,7 @@ import {
 import { format, subDays, startOfDay, parseISO } from 'date-fns';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { Expense, ExpenseCategory, SpendingInsight, Center, ExpenseStatus } from './types';
+import { BudgetHistory, Expense, ExpenseCategory, SpendingInsight, Center, ExpenseStatus } from './types';
 import { getSpendingInsights } from './lib/gemini';
 import { cn, formatCurrency } from './lib/utils';
 import { db, handleFirestoreError, OperationType } from './lib/firebase';
@@ -30,6 +30,8 @@ import {
   setDoc, 
   deleteDoc, 
   updateDoc, 
+  addDoc,
+  orderBy,
   serverTimestamp, 
   Timestamp
 } from 'firebase/firestore';
@@ -59,10 +61,24 @@ const INITIAL_EXPENSES: Expense[] = [
   { id: '4', merchant: 'Microsoft Azure', amount: 12000.00, date: '2024-05-03T09:00:00Z', category: 'Software/SaaS', status: 'Approved', centerId: 'c2' },
 ];
 
+interface UnifiedActivityItem {
+  id: string;
+  type: 'expense' | 'budget';
+  title: string;
+  amount: number;
+  date: string;
+  status?: ExpenseStatus;
+  category?: string;
+  description?: string;
+  billUrl?: string;
+  originalItem: Expense | BudgetHistory;
+}
+
 export default function App() {
   const [centers, setCenters] = useState<Center[]>([]);
   const [activeCenterId, setActiveCenterId] = useState<string>('');
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [budgetHistory, setBudgetHistory] = useState<BudgetHistory[]>([]);
   const [userProfile, setUserProfile] = useState({
     name: 'Felix Henderson',
     role: 'Head of Operations',
@@ -97,13 +113,8 @@ export default function App() {
   useEffect(() => {
     const rootPath = `shared_ledger/global_instance`;
     
-    const centersPath = `${rootPath}/centers`;
-    const unsubCenters = onSnapshot(query(collection(db, centersPath)), (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Center));
-      setCenters(data);
-    }, (error) => handleFirestoreError(error, OperationType.GET, centersPath));
-
     const expensesPath = `${rootPath}/expenses`;
+    const centersPath = `${rootPath}/centers`;
     const unsubExpenses = onSnapshot(query(collection(db, expensesPath)), (snapshot) => {
       const data = snapshot.docs.map(doc => {
         const d = doc.data();
@@ -116,6 +127,26 @@ export default function App() {
       });
       setExpenses(data);
     }, (error) => handleFirestoreError(error, OperationType.GET, expensesPath));
+
+    const unsubCenters = onSnapshot(query(collection(db, centersPath)), (snapshot) => {
+      const data = snapshot.docs.map(doc => {
+        const d = doc.data();
+        return { 
+          id: doc.id, 
+          ...d,
+          updatedAt: d.updatedAt instanceof Timestamp ? d.updatedAt.toDate().toISOString() : d.updatedAt
+        } as Center;
+      });
+      setCenters(data);
+      
+      // Ensure we have an active center
+      if (data.length > 0) {
+        setActiveCenterId(prev => {
+          if (prev) return prev;
+          return data[0].id;
+        });
+      }
+    }, (error) => handleFirestoreError(error, OperationType.GET, centersPath));
 
     const profilePath = `${rootPath}/profile/settings`;
     const unsubProfile = onSnapshot(doc(db, profilePath), (snapshot) => {
@@ -172,6 +203,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!activeCenterId) return;
+    const historyPath = `shared_ledger/global_instance/centers/${activeCenterId}/history`;
+    const unsubHistory = onSnapshot(query(collection(db, historyPath), orderBy('updatedAt', 'desc')), (snapshot) => {
+      setBudgetHistory(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as BudgetHistory)));
+    }, (error) => handleFirestoreError(error, OperationType.GET, historyPath));
+
+    return () => unsubHistory();
+  }, [activeCenterId]);
+
+  useEffect(() => {
     const handleResize = () => {
       if (window.innerWidth < 1024) setIsSidebarOpen(false);
       else setIsSidebarOpen(true);
@@ -187,6 +228,7 @@ export default function App() {
 
   const totalBudget = activeCenter?.budget || 0;
   const [tempBudget, setTempBudget] = useState(totalBudget.toString());
+  const [budgetDate, setBudgetDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [tempProfile, setTempProfile] = useState(userProfile);
   const [newCenterName, setNewCenterName] = useState('');
@@ -197,7 +239,7 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
-  const [sortConfig, setSortConfig] = useState<{ key: keyof Expense; direction: 'asc' | 'desc' } | null>(null);
+  const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' } | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [currentView, setCurrentView] = useState<'Dashboard' | 'Activity' | 'Settings'>('Dashboard');
   const [showEditModal, setShowEditModal] = useState(false);
@@ -257,6 +299,7 @@ export default function App() {
   const handleSetBudget = () => {
     setShowBudgetModal(true);
     setTempBudget(totalBudget.toString());
+    setBudgetDate(format(new Date(), 'yyyy-MM-dd'));
   };
 
   const saveBudget = async (e: React.FormEvent) => {
@@ -264,8 +307,20 @@ export default function App() {
     const val = parseFloat(tempBudget);
     if (!isNaN(val) && val >= 0 && activeCenterId) {
       const path = `shared_ledger/global_instance/centers/${activeCenterId}`;
+      const historyPath = `${path}/history`;
       try {
-        await updateDoc(doc(db, path), { budget: val });
+        const now = Timestamp.now();
+        await updateDoc(doc(db, path), { 
+          budget: val,
+          updatedAt: now
+        });
+        
+        await addDoc(collection(db, historyPath), {
+          amount: val,
+          updatedAt: now,
+          date: budgetDate
+        });
+
         setShowBudgetModal(false);
       } catch (e) {
         handleFirestoreError(e, OperationType.UPDATE, path);
@@ -282,7 +337,8 @@ export default function App() {
       await setDoc(doc(db, path), {
         name: newCenterName,
         budget: Number(newCenterBudget),
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        updatedAt: Timestamp.now()
       });
       setActiveCenterId(centerId);
       setShowCenterModal(false);
@@ -299,7 +355,8 @@ export default function App() {
     try {
       await updateDoc(doc(db, path), {
         name: centerToEdit.name,
-        budget: centerToEdit.budget
+        budget: centerToEdit.budget,
+        updatedAt: Timestamp.now()
       });
       setShowEditCenterModal(false);
       setCenterToEdit(null);
@@ -366,6 +423,61 @@ export default function App() {
   const centerExpenses = useMemo(() => 
     expenses.filter(e => e.centerId === activeCenterId), 
   [expenses, activeCenterId]);
+
+  const combinedActivity = useMemo(() => {
+    const expenseItems: UnifiedActivityItem[] = centerExpenses.map(e => ({
+      id: e.id,
+      type: 'expense',
+      title: e.merchant,
+      amount: e.amount,
+      date: e.date,
+      status: e.status,
+      category: e.category,
+      description: e.description,
+      billUrl: e.billUrl,
+      originalItem: e
+    }));
+
+    const budgetItems: UnifiedActivityItem[] = budgetHistory.map(b => ({
+      id: b.id,
+      type: 'budget',
+      title: 'Budget Allocation',
+      amount: b.amount,
+      date: b.date,
+      originalItem: b
+    }));
+
+    let result = [...expenseItems, ...budgetItems];
+
+    if (sortConfig) {
+      result.sort((a, b) => {
+        let aValue: any = a[sortConfig.key as keyof UnifiedActivityItem] ?? '';
+        let bValue: any = b[sortConfig.key as keyof UnifiedActivityItem] ?? '';
+        
+        if (typeof aValue === 'string') aValue = aValue.toLowerCase();
+        if (typeof bValue === 'string') bValue = bValue.toLowerCase();
+
+        if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
+        if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
+        return 0;
+      });
+    } else {
+      result.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    }
+
+    return result;
+  }, [centerExpenses, budgetHistory, sortConfig]);
+
+  const dashCombinedActivity = useMemo(() => {
+    if (!selectedDate) return combinedActivity;
+    return combinedActivity.filter(item => {
+      try {
+        return format(parseISO(item.date), 'yyyy-MM-dd') === selectedDate;
+      } catch {
+        return item.date === selectedDate;
+      }
+    });
+  }, [combinedActivity, selectedDate]);
 
   const dashExpenses = useMemo(() => {
     if (!selectedDate) return centerExpenses;
@@ -490,7 +602,7 @@ export default function App() {
     return result;
   }, [centerExpenses, statusFilter, sortConfig, selectedDate]);
 
-  const toggleSort = (key: keyof Expense) => {
+  const toggleSort = (key: string) => {
     let direction: 'asc' | 'desc' = 'asc';
     if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
       direction = 'desc';
@@ -680,10 +792,15 @@ export default function App() {
                   >
                     <Building2 size={20} className={activeCenterId === center.id ? "text-white" : "text-[#52525b]"} />
                     {isSidebarOpen && (
-                      <div className="flex flex-col items-start overflow-hidden pr-8">
-                        <span className="text-[11px] uppercase tracking-widest font-bold truncate w-full text-left">{center.name}</span>
-                        <span className="text-[9px] text-[var(--app-muted)] font-mono">{formatCurrency(center.budget)} cap</span>
-                      </div>
+                        <div className="flex flex-col items-start overflow-hidden pr-8">
+                          <span className="text-[11px] uppercase tracking-widest font-bold truncate w-full text-left">{center.name}</span>
+                          <div className="flex flex-col items-start">
+                            <span className="text-[9px] text-[var(--app-muted)] font-mono">{formatCurrency(center.budget)} cap</span>
+                            {center.updatedAt && (
+                              <span className="text-[7px] text-[var(--app-muted)] uppercase tracking-tighter mt-0.5">Updated: {format(new Date(center.updatedAt), 'MMM dd, yyyy')}</span>
+                            )}
+                          </div>
+                        </div>
                     )}
                   </button>
                   {isSidebarOpen && activeCenterId === center.id && (
@@ -826,7 +943,8 @@ export default function App() {
                   <SummaryCard 
                     title="Budget Utilization"
                     value={formatCurrency(totalBudget)}
-                    trend={`${Math.round((totalSpent/totalBudget) * 100)}% of allocation`}
+                    trend={`${totalBudget > 0 ? Math.round((totalSpent/totalBudget) * 100) : 0}% of allocation`}
+                    subtitle={activeCenter?.updatedAt ? `Last Sync: ${format(new Date(activeCenter.updatedAt), 'MMM dd, yyyy')}` : "Asset Allocation Unchanged"}
                     icon={<TrendingDown size={20} />}
                     variant="success"
                   />
@@ -892,13 +1010,22 @@ export default function App() {
                     </div>
 
                     {/* Transactions Table */}
-                    <ExpensesTable 
-                      filteredExpenses={filteredExpenses}
+                    <ActivityTable 
+                      items={dashCombinedActivity.filter(item => {
+                        if (statusFilter === 'All') return true;
+                        return item.status === statusFilter;
+                      })}
                       selectedIds={selectedIds}
                       toggleSelectAll={toggleSelectAll}
                       toggleSelect={toggleSelect}
-                      sortConfig={sortConfig}
-                      toggleSort={toggleSort}
+                      sortConfig={sortConfig ? { key: sortConfig.key, direction: sortConfig.direction } : null}
+                      toggleSort={(key) => {
+                        let direction: 'asc' | 'desc' = 'asc';
+                        if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
+                          direction = 'desc';
+                        }
+                        setSortConfig({ key: key as any, direction });
+                      }}
                       statusFilter={statusFilter}
                       setStatusFilter={setStatusFilter}
                       onAddClick={() => setShowAddModal(true)}
@@ -977,13 +1104,22 @@ export default function App() {
             )}
 
               {currentView === 'Activity' && (
-                <ExpensesTable 
-                  filteredExpenses={filteredExpenses}
+                <ActivityTable 
+                  items={combinedActivity.filter(item => {
+                    if (statusFilter === 'All') return true;
+                    return item.status === statusFilter;
+                  })}
                   selectedIds={selectedIds}
                   toggleSelectAll={toggleSelectAll}
                   toggleSelect={toggleSelect}
-                  sortConfig={sortConfig}
-                  toggleSort={toggleSort}
+                  sortConfig={sortConfig ? { key: sortConfig.key, direction: sortConfig.direction } : null}
+                  toggleSort={(key) => {
+                    let direction: 'asc' | 'desc' = 'asc';
+                    if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
+                      direction = 'desc';
+                    }
+                    setSortConfig({ key: key as any, direction });
+                  }}
                   statusFilter={statusFilter}
                   setStatusFilter={setStatusFilter}
                   onAddClick={() => setShowAddModal(true)}
@@ -995,7 +1131,7 @@ export default function App() {
                     setShowBillModal(true);
                   }}
                   onEdit={handleEditExpense}
-                  title="Recorded Transactions"
+                  title="Recorded Transactions & Logs"
                 />
               )}
             {currentView === 'Settings' && (
@@ -1056,17 +1192,46 @@ export default function App() {
               </div>
 
               <form onSubmit={saveBudget} className="space-y-6">
-                <div className="space-y-3">
-                  <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Monthly Allocation (INR)</label>
-                  <input 
-                    autoFocus
-                    type="number" 
-                    value={tempBudget}
-                    onChange={e => setTempBudget(e.target.value)}
-                    className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-mono text-lg"
-                    placeholder="500000"
-                  />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Monthly Allocation (INR)</label>
+                    <input 
+                      autoFocus
+                      type="number" 
+                      value={tempBudget}
+                      onChange={e => setTempBudget(e.target.value)}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-mono text-lg"
+                      placeholder="500000"
+                    />
+                  </div>
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-[0.2em]">Effective Date</label>
+                    <input 
+                      type="date" 
+                      value={budgetDate}
+                      onChange={e => setBudgetDate(e.target.value)}
+                      className="w-full px-5 py-4 bg-[var(--app-bg)] rounded-xl border border-[var(--app-inner-border)] text-[var(--app-text)] focus:border-[var(--app-muted)] transition-all outline-none font-medium"
+                    />
+                  </div>
                 </div>
+
+                {budgetHistory.length > 0 && (
+                  <div className="pt-4 border-t border-[var(--app-inner-border)]">
+                    <p className="text-[10px] font-bold text-[var(--app-muted)] uppercase tracking-widest mb-4">Allocation History</p>
+                    <div className="space-y-2 max-h-32 overflow-y-auto pr-2 custom-scrollbar">
+                      {budgetHistory.map((item) => (
+                        <div key={item.id} className="flex items-center justify-between p-3 bg-[var(--app-bg)] rounded-lg border border-[var(--app-inner-border)]">
+                          <div className="flex flex-col">
+                            <span className="text-[10px] font-bold text-[var(--app-text)]">{formatCurrency(item.amount)}</span>
+                            <span className="text-[8px] font-bold text-[var(--app-muted)] uppercase">{format(new Date(item.date), 'MMM dd, yyyy')}</span>
+                          </div>
+                          <History size={12} className="text-[var(--app-muted)] opacity-30" />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <button 
                   type="submit"
                   className="w-full bg-[var(--app-accent)] hover:opacity-90 text-[var(--app-accent-foreground)] font-bold py-5 rounded-2xl uppercase tracking-[0.2em] text-xs transition-all active:scale-[0.98]"
@@ -1873,7 +2038,7 @@ function NavItem({ icon, label, active, onClick, isSidebarOpen }: { icon: React.
   );
 }
 
-function SummaryCard({ title, value, trend, icon, variant }: { title: string, value: string, trend: string, icon: React.ReactNode, variant: 'primary' | 'warning' | 'success' | 'info' | 'danger' }) {
+function SummaryCard({ title, value, trend, icon, variant, subtitle }: { title: string, value: string, trend: string, icon: React.ReactNode, variant: 'primary' | 'warning' | 'success' | 'info' | 'danger', subtitle?: string }) {
   const borderColors = {
     primary: "border-l-zinc-500",
     warning: "border-l-amber-500/50",
@@ -1888,8 +2053,13 @@ function SummaryCard({ title, value, trend, icon, variant }: { title: string, va
       borderColors[variant]
     )}>
       <div className="flex items-start justify-between">
-        <div className="flex flex-col gap-8 h-full justify-between">
-          <p className="text-[11px] font-bold text-[#71717a] uppercase tracking-[0.2em]">{title}</p>
+        <div className="flex flex-col gap-6 h-full justify-between">
+          <div className="space-y-1">
+            <p className="text-[11px] font-bold text-[#71717a] uppercase tracking-[0.2em]">{title}</p>
+            {subtitle && (
+              <p className="text-[8px] font-bold text-[var(--app-muted)] uppercase tracking-widest">{subtitle}</p>
+            )}
+          </div>
           <div className="space-y-1">
             <h3 className="text-3xl font-light text-white tracking-tighter transition-transform group-hover:translate-x-1">{value}</h3>
             <p className={cn(
@@ -1969,8 +2139,8 @@ function Skeleton({ className }: { className?: string }) {
 }
 
 // Separate View Components
-function ExpensesTable({ 
-  filteredExpenses, 
+function ActivityTable({ 
+  items, 
   selectedIds, 
   toggleSelectAll, 
   toggleSelect, 
@@ -1986,12 +2156,12 @@ function ExpensesTable({
   onEdit,
   title = "Real-Time Transactions"
 }: { 
-  filteredExpenses: Expense[], 
+  items: UnifiedActivityItem[], 
   selectedIds: Set<string>, 
   toggleSelectAll: () => void, 
   toggleSelect: (id: string) => void, 
-  sortConfig: { key: keyof Expense; direction: 'asc' | 'desc' } | null, 
-  toggleSort: (key: keyof Expense) => void, 
+  sortConfig: { key: string; direction: 'asc' | 'desc' } | null, 
+  toggleSort: (key: any) => void, 
   statusFilter: Expense['status'] | 'All', 
   setStatusFilter: (filter: Expense['status'] | 'All') => void,
   onAddClick: () => void,
@@ -2100,20 +2270,20 @@ function ExpensesTable({
                 <input 
                   type="checkbox" 
                   className="accent-[var(--app-accent)] cursor-pointer"
-                  checked={selectedIds.size > 0 && selectedIds.size === filteredExpenses.length}
+                  checked={selectedIds.size > 0 && selectedIds.size === items.length}
                   onChange={toggleSelectAll}
                 />
               </th>
-              <th className="px-8 py-4 cursor-pointer hover:text-[var(--app-text)] transition-colors" onClick={() => toggleSort('merchant')}>
+              <th className="px-8 py-4 cursor-pointer hover:text-[var(--app-text)] transition-colors" onClick={() => toggleSort('title')}>
                 <div className="flex items-center gap-2">
                   Merchant / Asset
-                  <SortIcon active={sortConfig?.key === 'merchant'} direction={sortConfig?.direction} />
+                  <SortIcon active={sortConfig?.key === 'title'} direction={sortConfig?.direction} />
                 </div>
               </th>
               <th className="px-8 py-4">Status</th>
               <th className="px-8 py-4 cursor-pointer hover:text-[var(--app-text)] transition-colors" onClick={() => toggleSort('category')}>
                 <div className="flex items-center gap-2">
-                  Category
+                  Type / Category
                   <SortIcon active={sortConfig?.key === 'category'} direction={sortConfig?.direction} />
                 </div>
               </th>
@@ -2123,96 +2293,139 @@ function ExpensesTable({
                   <SortIcon active={sortConfig?.key === 'amount'} direction={sortConfig?.direction} />
                 </div>
               </th>
-              <th className="px-8 py-4 text-center">Receipt</th>
+              <th className="px-8 py-4 text-center">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--app-border)]">
-            {filteredExpenses.map((expense) => (
+            {items.map((item) => (
               <motion.tr 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                key={expense.id} 
+                key={item.id} 
                 className={cn(
                   "hover:bg-[var(--app-hover)] transition-colors group cursor-pointer",
-                  selectedIds.has(expense.id) && "bg-[var(--app-hover)]"
+                  selectedIds.has(item.id) && "bg-[var(--app-hover)]"
                 )}
-                onClick={() => toggleSelect(expense.id)}
+                onClick={() => {
+                  if (item.type === 'expense') {
+                    toggleSelect(item.id);
+                  }
+                }}
               >
                 <td className="px-8 py-5" onClick={(e) => e.stopPropagation()}>
-                  <input 
-                    type="checkbox" 
-                    className="accent-[var(--app-accent)] cursor-pointer"
-                    checked={selectedIds.has(expense.id)}
-                    onChange={() => toggleSelect(expense.id)}
-                  />
+                  {item.type === 'expense' && (
+                    <input 
+                      type="checkbox" 
+                      className="accent-[var(--app-accent)] cursor-pointer"
+                      checked={selectedIds.has(item.id)}
+                      onChange={() => toggleSelect(item.id)}
+                    />
+                  )}
                 </td>
                 <td className="px-8 py-5">
                   <div className="flex items-center gap-4">
-                    <div className="w-10 h-10 bg-[var(--app-hover)] border border-[var(--app-inner-border)] rounded-xl flex items-center justify-center text-[var(--app-text)] font-mono group-hover:border-[var(--app-muted)] transition-all">
-                      {expense.merchant[0]}
+                    <div className={cn(
+                      "w-10 h-10 border rounded-xl flex items-center justify-center font-mono transition-all",
+                      item.type === 'expense' 
+                        ? "bg-[var(--app-hover)] border-[var(--app-inner-border)] text-[var(--app-text)] group-hover:border-[var(--app-muted)]" 
+                        : "bg-emerald-500/10 border-emerald-500/20 text-emerald-500"
+                    )}>
+                      {item.type === 'expense' ? item.title[0] : <Wallet size={16} />}
                     </div>
                     <div>
-                      <div className="font-semibold text-[var(--app-text)] tracking-tight">{expense.merchant}</div>
-                      <div className="text-[11px] text-[var(--app-muted)] font-medium">{format(parseISO(expense.date), 'MMM dd, yyyy')}</div>
+                      <div className="font-semibold text-[var(--app-text)] tracking-tight">{item.title}</div>
+                      <div className="text-[11px] text-[var(--app-muted)] font-medium">
+                        {format(parseISO(item.date), 'MMM dd, yyyy')}
+                        {item.type === 'budget' && (
+                          <span className="ml-2 text-[9px] bg-emerald-500/10 text-emerald-500 px-1.5 py-0.5 rounded uppercase tracking-tighter">Budget Log</span>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </td>
                 <td className="px-8 py-5">
-                  <StatusBadge status={expense.status} />
+                  {item.type === 'expense' ? (
+                    <StatusBadge status={item.status!} />
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-emerald-500 text-[10px] font-bold uppercase tracking-widest">
+                      <CheckCircle2 size={12} />
+                      Synced
+                    </div>
+                  )}
                 </td>
                 <td className="px-8 py-5">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--app-muted)] px-3 py-1 bg-[var(--app-hover)] border border-[var(--app-inner-border)] rounded-md group-hover:text-[var(--app-text)] transition-colors">{expense.category}</span>
+                  <span className={cn(
+                    "text-[10px] font-bold uppercase tracking-wider px-3 py-1 border rounded-md transition-colors",
+                    item.type === 'expense'
+                      ? "text-[var(--app-muted)] bg-[var(--app-hover)] border-[var(--app-inner-border)] group-hover:text-[var(--app-text)]"
+                      : "text-emerald-500 bg-emerald-500/10 border-emerald-500/20"
+                  )}>
+                    {item.type === 'expense' ? item.category : 'Capital'}
+                  </span>
                 </td>
                 <td className="px-8 py-5 text-right">
-                  <span className="font-mono text-[var(--app-text)] text-base">{formatCurrency(expense.amount)}</span>
+                  <span className={cn(
+                    "font-mono text-base",
+                    item.type === 'expense' ? "text-[var(--app-text)]" : "text-emerald-400 font-bold"
+                  )}>
+                    {item.type === 'expense' ? '-' : '+'}{formatCurrency(item.amount)}
+                  </span>
                 </td>
                 <td className="px-8 py-5 text-center">
                   <div className="flex items-center justify-center gap-2">
-                    {expense.billUrl ? (
+                    {item.type === 'expense' ? (
                       <>
+                        {item.billUrl ? (
+                          <>
+                            <button 
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onViewBill(item.billUrl!);
+                              }}
+                              className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-accent)] transition-all flex items-center justify-center group/eye"
+                              title="View Bill Receipt"
+                            >
+                              <Eye size={16} className="transition-transform group-hover/eye:scale-110" />
+                            </button>
+                            <a 
+                              href={item.billUrl}
+                              download={`bill_${item.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.png`}
+                              onClick={(e) => e.stopPropagation()}
+                              className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/dl"
+                              title="Download Receipt"
+                            >
+                              <Download size={16} className="transition-transform group-hover/dl:scale-110" />
+                            </a>
+                          </>
+                        ) : (
+                          <div className="w-10 h-10 border border-dashed border-[var(--app-inner-border)] rounded-xl flex items-center justify-center opacity-40">
+                            <span className="text-[8px] font-bold text-[var(--app-muted)] uppercase">NA</span>
+                          </div>
+                        )}
                         <button 
                           onClick={(e) => {
                             e.stopPropagation();
-                            onViewBill(expense.billUrl!);
+                            onEdit(item.originalItem as Expense);
                           }}
-                          className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-accent)] transition-all flex items-center justify-center group/eye"
-                          title="View Bill Receipt"
+                          className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/edit"
+                          title="Edit Transaction"
                         >
-                          <Eye size={16} className="transition-transform group-hover/eye:scale-110" />
+                           <FileText size={16} className="transition-transform group-hover/edit:scale-110" />
                         </button>
-                        <a 
-                          href={expense.billUrl}
-                          download={`bill_${expense.merchant.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.png`}
-                          onClick={(e) => e.stopPropagation()}
-                          className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/dl"
-                          title="Download Receipt"
-                        >
-                          <Download size={16} className="transition-transform group-hover/dl:scale-110" />
-                        </a>
                       </>
                     ) : (
-                      <div className="w-10 h-10 border border-dashed border-[var(--app-inner-border)] rounded-xl flex items-center justify-center opacity-40">
-                        <span className="text-[8px] font-bold text-[var(--app-muted)] uppercase">NA</span>
+                      <div className="w-10 h-10 bg-[var(--app-hover)] rounded-xl flex items-center justify-center text-[var(--app-muted)] opacity-30">
+                        <Lock size={14} />
                       </div>
                     )}
-                    <button 
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onEdit(expense);
-                      }}
-                      className="p-2.5 bg-[var(--app-hover)] hover:bg-[var(--app-inner-border)] border border-[var(--app-inner-border)] hover:border-[var(--app-muted)] rounded-xl text-[var(--app-muted)] hover:text-[var(--app-text)] transition-all flex items-center justify-center group/edit"
-                      title="Edit Transaction"
-                    >
-                       <FileText size={16} className="transition-transform group-hover/edit:scale-110" />
-                    </button>
                   </div>
                 </td>
               </motion.tr>
             ))}
-            {filteredExpenses.length === 0 && (
+            {items.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-8 py-12 text-center text-[#52525b] text-xs font-bold uppercase tracking-widest">
-                  No transactions found for this filter
+                <td colSpan={6} className="px-8 py-12 text-center text-[#52525b] text-xs font-bold uppercase tracking-widest">
+                  No activity found for this filter
                 </td>
               </tr>
             )}

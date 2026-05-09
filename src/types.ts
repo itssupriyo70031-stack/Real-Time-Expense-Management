@@ -7,10 +7,19 @@ export type ExpenseCategory = 'Travel' | 'Food & Beverage' | 'Software/SaaS' | '
 
 export type ExpenseStatus = 'Pending' | 'Approved' | 'Declined' | 'Reimbursed';
 
+export interface BudgetHistory {
+  id: string;
+  amount: number;
+  date: string;
+  updatedAt: string;
+}
+
 export interface Center {
   id: string;
   name: string;
   budget: number;
+  updatedAt?: string;
+  history?: BudgetHistory[];
 }
 
 export interface Expense {

@@ -13,26 +13,25 @@ service cloud.firestore {
              data.budget is number;
     }
 
+    function isValidBudgetHistory(data) {
+      return data.keys().hasAll(['amount', 'date', 'updatedAt']) &&
+             data.amount is number &&
+             data.date is string &&
+             data.updatedAt is timestamp;
+    }
+
     function isValidExpense(data) {
       return data.keys().hasAll(['merchant', 'amount', 'category', 'date', 'status', 'centerId']) &&
              data.amount is number &&
              data.status in ['Pending', 'Approved', 'Declined', 'Reimbursed'];
     }
 
-    // Shared Ledger Access (No Login Required)
+    // Shared Ledger Access (Public Read/Write for this specific app instance)
     match /shared_ledger/global_instance {
       allow get: if true;
       allow write: if true;
 
-      match /centers/{centerId} {
-        allow read, write: if true;
-      }
-
-      match /expenses/{expenseId} {
-        allow read, write: if true;
-      }
-
-      match /profile/settings {
+      match /{allPaths=**} {
         allow read, write: if true;
       }
     }

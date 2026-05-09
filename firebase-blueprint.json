@@ -38,20 +38,35 @@
         "activeCenterId": { "type": "string" },
         "theme": { "type": "string", "enum": ["light", "dark"] }
       }
+    },
+    "budgetHistory": {
+      "title": "Budget History",
+      "description": "Log of budget changes for a center.",
+      "type": "object",
+      "properties": {
+        "amount": { "type": "number" },
+        "date": { "type": "string", "format": "date" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["amount", "date", "updatedAt"]
     }
   },
   "firestore": {
-    "/users/{userId}/centers/{centerId}": {
+    "/shared_ledger/global_instance/centers/{centerId}": {
       "schema": "center",
-      "description": "User's financial centers."
+      "description": "Financial centers in the shared ledger."
     },
-    "/users/{userId}/expenses/{expenseId}": {
+    "/shared_ledger/global_instance/centers/{centerId}/history/{historyId}": {
+      "schema": "budgetHistory",
+      "description": "History of budget allocations."
+    },
+    "/shared_ledger/global_instance/expenses/{expenseId}": {
       "schema": "expense",
-      "description": "User's recorded expenses."
+      "description": "Expenses in the shared ledger."
     },
-    "/users/{userId}/profile/settings": {
+    "/shared_ledger/global_instance/profile/settings": {
       "schema": "profile",
-      "description": "User's profile and application settings."
+      "description": "Global application settings."
     }
   }
 }
